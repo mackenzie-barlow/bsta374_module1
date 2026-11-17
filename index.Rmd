@@ -1,0 +1,212 @@
+---
+title: "Heart Disease Deaths in Michigan, 2000-2023"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme: cosmo
+    source_code: embed
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(sf)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(plotly)
+library(leaflet)
+library(DT)
+library(tigris)
+
+options(tigris_use_cache = TRUE)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Read Michigan data
+mi_wide <- read_csv("COUNTandPOP2000to2023.csv")
+
+# Create Michigan county boundaries
+mi_map <- counties(
+  state = "MI",
+  cb = TRUE,
+  year = 2020,
+  progress_bar = FALSE
+) |>
+  st_transform(4326)
+
+# Reshape data into one row per county per year
+mi_long <- mi_wide |>
+  pivot_longer(
+    cols = `2000`:`2023`,
+    names_to = "year",
+    values_to = "Y"
+  ) |>
+  mutate(year = as.integer(year))
+
+# Get statewide death counts
+mi_state <- mi_long |>
+  filter(County == "Michigan") |>
+  select(year, State_Deaths = Y)
+
+# Get statewide midpoint population
+state_population <- mi_wide |>
+  filter(County == "Michigan") |>
+  pull(Population)
+
+# Remove statewide row and prepare county data
+mi <- mi_long |>
+  filter(County != "Michigan")
+
+# Create county GEOID lookup
+county_lookup <- mi_map |>
+  st_drop_geometry() |>
+  transmute(
+    County = NAME,
+    GEOID = as.character(GEOID)
+  )
+
+# Join GEOIDs to Michigan county data
+mi <- mi |>
+  left_join(county_lookup, by = "County")
+
+# Calculate expected deaths and SIR
+#mi <- mi |>
+#  left_join(mi_state, by = "year") |>
+#  mutate(
+#    State_Rate = (State_Deaths / state_population) * 100000,
+#    E = Population * State_Rate / 100000,
+#    SIR = Y / E
+#  )
+
+# Calculate overall Michigan death rate (2000-2023)
+State_Rate <- (sum(mi_state$State_Deaths) /
+                 (state_population * nrow(mi_state))) * 100000
+
+# Calculate expected deaths and SIR
+mi <- mi |>
+  mutate(
+    E = Population * State_Rate / 100000,
+    SIR = Y / E
+  )
+
+# For the map: one row per county
+by_county <- mi |>
+  group_by(GEOID) |>
+  summarise(
+    Y = sum(Y),
+    E = sum(E),
+    .groups = "drop"
+  ) |>
+  mutate(SIR = Y / E)
+
+mi_map <- left_join(mi_map, by_county, by = "GEOID")
+
+# For the time series: one row per year
+focus <- "Wayne"
+
+#by_year <- bind_rows(
+#  mi |>
+#    group_by(year) |>
+#    summarise(Y = sum(Y), E = sum(E), .groups = "drop") |>
+#    mutate(area = "Michigan"),
+#  mi |>
+#    filter(County == focus) |>
+#    mutate(area = focus)
+#) |>
+#  mutate(SIR = Y / E)
+
+# Calculate annual SIR for Michigan and Wayne County
+by_year <- bind_rows(
+
+  # Michigan statewide
+  mi_state |>
+    mutate(
+      E = state_population * State_Rate / 100000,
+      Y = State_Deaths,
+      SIR = Y / E,
+      area = "Michigan"
+    ) |>
+    select(year, Y, E, SIR, area),
+
+  # Wayne County
+  mi |>
+    filter(County == focus) |>
+    mutate(area = focus) |>
+    select(year, Y, E, SIR, area)
+)
+```
+
+Column {data-width=600}
+-----------------------------------------------------------------------
+
+### Standardized incidence ratio (SIR) by county, 1968--1988
+
+```{r map}
+
+breaks <- c(0, 0.5, 2/3, 0.9, 1/0.9, 1.5, 2, Inf)
+
+pal <- colorBin(rev(RColorBrewer::brewer.pal(7, "RdBu")),
+                domain = mi_map$SIR, bins = breaks)
+
+# "CartoDB.Positron" doesnt work, so I subbed it with the help of AI
+# colors are chosen because blue can symbolize better, red for struggling counties, and white for counties that are perfoming as expected
+
+leaflet(mi_map) |>
+  addProviderTiles("Esri.WorldTopoMap") |>
+  addControl(
+    html = "<h4>SIR by county, Heart disease deaths from 2000 to 2023</h4>",
+    position = "topright"
+  ) |>
+  addPolygons(
+    fillColor = ~pal(SIR), fillOpacity = 0.8,
+    color = "white", weight = 1,
+    label = ~sprintf("%s: SIR %.2f (%.0f observed, %.0f expected)",
+                     NAME, SIR, Y, E),
+    highlightOptions = highlightOptions(weight = 2, color = "black",
+                                        bringToFront = TRUE)
+  ) |>
+  addLegend("bottomright", pal = pal, values = ~SIR, title = "SIR",
+            labFormat = labelFormat(digits = 2), opacity = 0.8)
+```
+
+> SIR = observed / expected. Red: more cases than expected; blue: fewer.
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+### SIR by year (dashed line: as many cases as expected)
+
+```{r timeseries}
+cols <- setNames(c("black", "#B2182B"), c("Michigan", focus))
+
+p <- ggplot(by_year, aes(year, SIR, colour = area)) +
+  geom_hline(yintercept = 1, linetype = 2, colour = "grey50") +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.2) +
+  scale_colour_manual(values = cols) +
+  labs(x = NULL, y = "SIR", colour = NULL, title = "SIR for Michigan and Wayne County, using deaths from heart disease (2000 to 2023)") +
+  theme_minimal()
+
+ggplotly(p)                                  # hover, zoom
+
+
+```
+
+Note: table shows that wayne county (Detroit, largest county) has historically had a much higher SIR than the state average. However, rates have dramatically fallen since, and Wayne has dropped below the state as of 2023. 
+
+
+### Counties
+
+```{r table}
+mi_map |>
+  st_drop_geometry() |>
+  transmute(County = NAME, Observed = Y,
+            Expected = round(E, 1), SIR = round(SIR, 2)) |>
+  arrange(desc(SIR)) |>
+  datatable(rownames = FALSE, options = list(pageLength = 10))
+```
+
+> Data: Moraga (2019), Ch. 7. Boundaries: US Census Bureau, via `tigris`.
+
+AI use note: used AI to use the dataset properly and to adapt it to the module, used help for errors
